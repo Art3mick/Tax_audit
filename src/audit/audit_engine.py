@@ -25,27 +25,17 @@ def audit_document(extracted_fields: Dict[str, Any]) -> Dict[str, Any]:
     customer_gstin = extracted_fields.get("customer_gstin")
     place_of_supply = extracted_fields.get("place_of_supply")
     taxable = extracted_fields.get("taxable_amount")
-    gst_rate = extracted_fields.get("gst_rate") or 18.0
+    gst_rate = extracted_fields.get("gst_rate")
+    if gst_rate is None and taxable and extracted_fields.get("total_tax") and taxable > 0:
+        gst_rate = round((extracted_fields["total_tax"] / taxable) * 100, 2)
+    if gst_rate is None:
+        gst_rate = 18.0
 
     regime = determine_tax_regime(supplier_gstin, customer_gstin, place_of_supply)
 
     expected_tax = None
     if taxable is not None:
         expected_tax = calculate_tax(taxable, gst_rate, regime)
-
-        # Auto-fill missing tax fields from tax engine if OCR didn't extract them
-        if extracted_fields.get("igst") is None and extracted_fields.get("cgst") is None:
-            if regime == "INTERSTATE":
-                extracted_fields["igst"] = expected_tax["igst"]
-            else:
-                extracted_fields["cgst"] = expected_tax["cgst"]
-                extracted_fields["sgst"] = expected_tax["sgst"]
-
-        if extracted_fields.get("total_tax") is None:
-            extracted_fields["total_tax"] = expected_tax["total_tax"]
-
-        if extracted_fields.get("total_amount") is None:
-            extracted_fields["total_amount"] = expected_tax["total_amount"]
 
     # -------------------------------------------------------------------
     # Step 2: Full tax validation (regime check + math check)

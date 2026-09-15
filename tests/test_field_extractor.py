@@ -17,6 +17,8 @@ def test_parse_date():
     assert parse_date("05-Mar-2020") == "2020-03-05"
     assert parse_date("05/03/2020") == "2020-03-05"
     assert parse_date("2020-03-05") == "2020-03-05"
+    assert parse_date("29 Mar 2026") == "2026-03-29"
+    assert parse_date("13 Apr 2026") == "2026-04-13"
 
 
 def test_extract_gstins():
@@ -25,6 +27,41 @@ def test_extract_gstins():
     assert len(gstins) == 2
     assert "24HDE7487RE5RT4" in gstins
     assert "07AOLCC1206D1ZG" in gstins
+
+
+def test_extract_fields_balaji_fruits():
+    sample = """
+    Balaji Dry Fruits. TAX INVOICE. ORIGINAL FOR RECIPIENT
+    301, Janta Fruits Market, Jaipur, Rajasthan, Invoice No: S10
+    302001 Invoice Date: 29 Mar 2026
+    GSTIN: 1234ABCD12X1
+    PAN NUMBER: ABCD12X1
+    BILL TO
+    Shyam Fruits
+    GSTIN: XYZ12345XA12
+    Place of Supply: Rajasthan
+
+    Almond 8135010 1.0 KG 904.76 45.24 (5%) 950.00
+    Cashew 8135010 1.0 Piece 857.14 42.86 (5%) 900.00
+    Raisin 8135010 1.0 KG 428.57 21.43 (5%) 450.00
+
+    Sub Total Taxable Amount: 2190.47
+    CGST @ 2.50% 54.77
+    SGST @ 2.50% 54.77
+    Total Amount: 2300.00
+    """
+    fields = extract_fields(sample)
+    assert fields["invoice_number"] == "S10"
+    assert fields["invoice_date"] == "2026-03-29"
+    assert fields["supplier_name"] == "Balaji Dry Fruits"
+    assert fields["supplier_gstin"] == "1234ABCD12X1"
+    assert fields["customer_gstin"] == "XYZ12345XA12"
+    assert fields["taxable_amount"] == 2190.47
+    assert fields["cgst"] == 54.77
+    assert fields["sgst"] == 54.77
+    assert fields["total_tax"] == 109.54
+    assert fields["gst_rate"] == 5.0
+    assert fields["total_amount"] == 2300.00
 
 
 def test_extract_fields_full_text():
