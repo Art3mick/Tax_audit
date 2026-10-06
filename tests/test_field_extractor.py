@@ -100,3 +100,48 @@ def test_extract_fields_full_text():
     assert fields["bank_details"]["account_number"] == "200000004512"
     assert fields["bank_details"]["ifsc"] == "SBIN0000488"
     assert len(fields["items"]) == 2
+
+
+def test_extract_fields_aarav_traders():
+    ocr_text = """
+    ORIGINAL FOR RECIPIENT
+    y. Aarav Traders
+    Aarav Traders Invoice No. : INV/2026/001
+    12, Industrial Area, Sitapura TAX INVOICE Invoice Date =: 05 Mar 2026
+    Jaipur - 302022, Rajasthan, india (Under Section 31 of CGST Act, 2017) Due Date 1 20 Mar 2026
+    Ph: +91 141 4056789 | Email: info@aaravtraders.in
+    ORIGINAL FOR RECIPIENT Place of Supply : Rajasthan (08)
+    GSTIN: 08AABCA1234F1Z5 Reverse Charge : No
+    BILL TO (CUSTOMER DETAILS) SHIP TO (DELIVERY ADDRESS)
+    Shree Retail Mart Pvt. Ltd. Shree Retail Mart Pvt. Ltd
+    14, MI Road, Jaipur - 302001 14, MI Road, Jaipur - 302001
+    Rajasthan, India Rajasthan, India
+    GSTIN: 08AAEFS9876H121
+
+    1 | Almonds (California) 08021210 10 KG 800.00 8,000.00 5% 200.00 200.00 8,400.00
+    2 | Cashew Nuts (W320) 08013220 5 KG 1,000.00 5,000.00 5% 125.00 125.00 5,250.00
+    3 Raisins (Black) 08062000 10 KG 300.00 3,000.00 5% 75.00 75.00 3,150.00
+
+    Total Taxable Amount (₹) 16,000.00
+    Remarks: Goods sold are of standard quality and as per quotation.
+    CGST @ 2.5% (%) 400.00
+    SGST @ 2.5% (8) 400.00
+    Total GST Amount (₹) 800.00
+    Grand Total (₹) 16,800.00
+    Amount in Words: INR Sixteen Thousand Eight Hundred Only
+    """
+    fields = extract_fields(ocr_text)
+
+    assert fields["invoice_number"] == "INV/2026/001"
+    assert fields["invoice_date"] == "2026-03-05"
+    assert fields["supplier_name"] == "Aarav Traders"
+    assert fields["supplier_gstin"] == "08AABCA1234F1Z5"
+    assert fields["customer_name"] == "Shree Retail Mart Pvt. Ltd."
+    assert fields["customer_gstin"] == "08AAEFS9876H121"
+    assert fields["taxable_amount"] == 16000.0
+    assert fields["cgst"] == 400.0
+    assert fields["sgst"] == 400.0
+    assert fields["total_tax"] == 800.0
+    assert fields["total_amount"] == 16800.0
+    assert len(fields["items"]) == 3
+

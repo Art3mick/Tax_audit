@@ -319,6 +319,28 @@ with tab_single:
         with col_save2:
             st.caption("Save this audit result to your records for future reference and GST filing.")
 
+        # ── RECOMMENDED ENHANCEMENTS & FUTURE ROADMAP ─────────────
+        st.markdown("---")
+        with st.expander("💡 Recommended Enhancements & Future Additions"):
+            st.markdown("""
+### 🚀 Features You Can Add to Level Up Your Tax Auditor
+
+1. **📲 WhatsApp & Email Invoice Bot Ingestion**
+   - Automatically ingest invoices forwarded by vendors to a WhatsApp business number or dedicated email address (e.g. `bills@yourdomain.com`).
+
+2. **🧾 E-Invoice & QR Code Verification**
+   - Read and decode B2B GST E-Invoice QR codes to verify Signed QR Signature directly with the GSTN portal for 100% fraud immunity.
+
+3. **🔄 Direct Export to Tally / Zoho Books / QuickBooks**
+   - One-click export of audited invoices into Tally Prime XML, Zoho Books API, or Excel format for automated purchase voucher posting without manual entry.
+
+4. **📊 Vendor Risk Scoring & Fraud Blacklist**
+   - Track vendor reliability over time. Flag vendors who repeatedly issue invoices with tax miscalculations, duplicate invoice numbers, or invalid GSTINs.
+
+5. **🔍 Automated GSTR-2B ITC Reconciliation**
+   - Match uploaded purchase invoices against monthly downloaded GSTR-2B JSON files to instantly catch missing vendor filings before claiming ITC.
+""")
+
 
 # ══════════════════════════════════════════════════════════════════
 # TAB 2 — BULK INVOICE CHECK

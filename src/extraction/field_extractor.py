@@ -4,14 +4,16 @@ from typing import Dict, Any, List, Optional
 
 def parse_number(text_val: Optional[str]) -> Optional[float]:
     """
-    Normalizes numeric strings by removing currency symbols, commas, spaces.
+    Normalizes numeric strings by removing currency symbols, commas, spaces,
+    and parenthetical noise (e.g. '(₹)', '(Rs)', '(2)', '(%)').
     Handles common OCR noise like 'O' -> '0'.
     """
     if not text_val:
         return None
     cleaned = str(text_val).strip()
-    # Remove currency symbols and formatting
-    cleaned = cleaned.replace("₹", "").replace("Rs.", "").replace("Rs", "").replace(",", "").replace(" ", "")
+    # Strip parenthetical non-digit noise (e.g., '(₹)', '(Rs)', '(2)', '(%)', '(8)')
+    cleaned = re.sub(r"\([^\d]*\)", "", cleaned)
+    cleaned = cleaned.replace("₹", "").replace("Rs.", "").replace("Rs", "").replace("INR", "").replace(",", "").replace(" ", "")
     # Replace OCR noise: capital O that should be 0 (only if surrounded by digits)
     cleaned = re.sub(r"(?<!\w)O(?!\w)", "0", cleaned)
     # Keep only digits and a single decimal point
@@ -127,31 +129,84 @@ def extract_amount_after_label(text: str, label_pattern: str) -> Optional[float]
     return None
 
 
+def clean_duplicate_phrase(text: str) -> str:
+    """
+    Deduplicates side-by-side repeated text blocks caused by multi-column layout OCR.
+    E.g. 'Shree Retail Mart Pvt. Ltd. Shree Retail Mart Pvt. Ltd' -> 'Shree Retail Mart Pvt. Ltd.'
+    """
+    if not text:
+        return text
+    s = text.strip()
+    words = s.split()
+    if len(words) >= 2 and len(words) % 2 == 0:
+        half = len(words) // 2
+        w1 = [w.strip(".,").lower() for w in words[:half]]
+        w2 = [w.strip(".,").lower() for w in words[half:]]
+        if w1 == w2:
+            return " ".join(words[:half])
+    return s
+
+
 def extract_line_items(text: str) -> List[Dict[str, Any]]:
     """
     Extracts tabular line items (description, HSN/SAC, qty, rate, taxable, tax%, total).
+    Supports multiple table formats across various Indian invoice software formats.
     """
     items = []
-    lines = text.split("\n")
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
 
-    # Full line-item pattern: sr_no, description, HSN, qty, [unit], rate, taxable, tax%, tax_amt, total
-    line_pattern = re.compile(
-        r"^\s*(\d{1,2})\s+\|?\s*(.*?)\s+(\d{4,8})\s+"
-        r"(\d+(?:[\.,]\d+)?)\s*(?:PCS|NOS|KG|LTR|MTR|UNIT|BAG|BOX|SET|PC|PIECE)?\s+"
-        r"([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s*"
-        r"(?:([\d.]+)\s*%?)?\s*"
+    # Pattern 1: sr_no | description | HSN | qty | unit | rate | taxable | tax% | cgst | sgst | total
+    line_pattern_1 = re.compile(
+        r"^\s*\|?\s*(\d{1,2})[\s\.\,\|]+([A-Za-z0-9 \-_&()]+?)\s+(\d{4,8})\s+"
+        r"(\d+(?:[\.,]\d+)?)\s*([A-Za-z]{1,5})?\s*\|?\s*"
+        r"([\d,]+(?:\.\d+)?)\s*\|?\s*([\d,]+(?:\.\d+)?)\s*\|?\s*"
+        r"(?:([\d.]+)\s*%?)?\s*\|?\s*"
+        r"(?:([\d,]+(?:\.\d+)?)\s*\|?\s*)?"
+        r"(?:([\d,]+(?:\.\d+)?)\s*\|?\s*)?"
+        r"([\d,]+(?:\.\d+)?)\s*\|?\s*$",
+        re.IGNORECASE
+    )
+
+    # Pattern 2: sr_no, description, HSN, qty, rate, taxable, tax_amt, total
+    line_pattern_2 = re.compile(
+        r"^\s*\|?\s*(\d{1,2})[\s\.\,\|]+([A-Za-z0-9 \-_&()]+?)\s+(\d{4,8})\s+"
+        r"(\d+(?:[\.,]\d+)?)\s*(?:[A-Za-z]{1,5})?\s*\|?\s*"
+        r"([\d,]+(?:\.\d+)?)\s*\|?\s*([\d,]+(?:\.\d+)?)\s*\|?\s*"
+        r"(?:([\d.]+)\s*%?)?\s*\|?\s*"
         r"(?:([\d,]+(?:\.\d+)?)\s*)?"
         r"([\d,]+(?:\.\d+)?)\s*\|?\s*$",
         re.IGNORECASE
     )
 
-    for line in lines:
-        match = line_pattern.search(line)
-        if match:
-            sr_no, desc, hsn, qty, rate, taxable, tax_pct, tax_amt, total = match.groups()
+    for idx, line in enumerate(lines, start=1):
+        if any(hdr in line.upper() for hdr in ["DESCRIPTION", "HSN/SAC", "SUBTOTAL", "GRAND TOTAL", "REMARKS", "BANK DETAILS", "TERMS"]):
+            continue
+
+        m1 = line_pattern_1.search(line)
+        if m1:
+            sr, desc, hsn, qty, unit, rate, taxable, tax_pct, cgst, sgst, total = m1.groups()
+            c_val = parse_number(cgst) or 0.0
+            s_val = parse_number(sgst) or 0.0
             items.append({
-                "sr_no": int(sr_no),
-                "description": desc.strip().strip("|").strip(),
+                "sr_no": int(sr),
+                "description": clean_duplicate_phrase(desc.strip().strip("|").strip()),
+                "hsn_sac": hsn.strip(),
+                "quantity": parse_number(qty),
+                "unit": (unit or "PCS").upper(),
+                "rate": parse_number(rate),
+                "taxable_amount": parse_number(taxable),
+                "tax_rate": parse_number(tax_pct) if tax_pct else None,
+                "tax_amount": round(c_val + s_val, 2) if (c_val + s_val) > 0 else None,
+                "total_amount": parse_number(total)
+            })
+            continue
+
+        m2 = line_pattern_2.search(line)
+        if m2:
+            sr, desc, hsn, qty, rate, taxable, tax_pct, tax_amt, total = m2.groups()
+            items.append({
+                "sr_no": int(sr),
+                "description": clean_duplicate_phrase(desc.strip().strip("|").strip()),
                 "hsn_sac": hsn.strip(),
                 "quantity": parse_number(qty),
                 "unit": "PCS",
@@ -161,12 +216,13 @@ def extract_line_items(text: str) -> List[Dict[str, Any]]:
                 "tax_amount": parse_number(tax_amt) if tax_amt else None,
                 "total_amount": parse_number(total)
             })
+            continue
 
-    # Line item pattern 2 (Description + HSN + Qty + Unit + Rate + Tax + Total without required sr_no)
+    # Fallback pattern 3: Description + HSN + Qty + Rate + Amount without sr_no
     if not items:
-        line_pattern_2 = re.compile(
+        line_pattern_3 = re.compile(
             r"^\s*(?:(\d{1,2})\s+)?([A-Za-z0-9 \-_&()]+?)\s+(\d{4,8})\s+"
-            r"(\d+(?:[\.,]\d+)?)\s*([A-Za-z]{1,6})\s+"
+            r"(\d+(?:[\.,]\d+)?)\s*([A-Za-z]{1,6})?\s+"
             r"([\d,]+(?:\.\d+)?)\s+"
             r"([\d,]+(?:\.\d+)?)\s*"
             r"(?:\((\d+(?:\.\d+)?)\%\))?\s*"
@@ -174,42 +230,22 @@ def extract_line_items(text: str) -> List[Dict[str, Any]]:
             re.IGNORECASE
         )
         for idx, line in enumerate(lines, start=1):
-            m2 = line_pattern_2.search(line)
-            if m2:
-                sr, desc, hsn, qty, unit, rate, tax_amt, tax_pct, total = m2.groups()
+            if any(hdr in line.upper() for hdr in ["DESCRIPTION", "HSN/SAC", "SUBTOTAL", "GRAND TOTAL", "REMARKS", "BANK"]):
+                continue
+            m3 = line_pattern_3.search(line)
+            if m3:
+                sr, desc, hsn, qty, unit, rate, tax_amt, tax_pct, total = m3.groups()
                 items.append({
                     "sr_no": int(sr) if sr else idx,
-                    "description": desc.strip(),
+                    "description": clean_duplicate_phrase(desc.strip()),
                     "hsn_sac": hsn.strip(),
                     "quantity": parse_number(qty),
-                    "unit": unit.upper(),
+                    "unit": (unit or "PCS").upper(),
                     "rate": parse_number(rate),
                     "taxable_amount": round((parse_number(qty) or 1.0) * (parse_number(rate) or 0.0), 2) if parse_number(rate) else None,
                     "tax_rate": parse_number(tax_pct) if tax_pct else None,
                     "tax_amount": parse_number(tax_amt) if tax_amt else None,
                     "total_amount": parse_number(total)
-                })
-
-    # Simpler fallback: sr_no + HSN + at least two numbers
-    if not items:
-        fallback_pattern = re.compile(
-            r"(\d{1,2})\s+\|?\s*([A-Za-z0-9 \-_&()]+?)\s+(\d{4,8})\s+(\d+(?:[\.,]\d+)?)"
-        )
-        for line in lines:
-            f_match = fallback_pattern.search(line)
-            if f_match:
-                sr, desc, hsn, qty = f_match.groups()
-                items.append({
-                    "sr_no": int(sr),
-                    "description": desc.strip().strip("|").strip(),
-                    "hsn_sac": hsn,
-                    "quantity": parse_number(qty),
-                    "unit": "PCS",
-                    "rate": None,
-                    "taxable_amount": None,
-                    "tax_rate": None,
-                    "tax_amount": None,
-                    "total_amount": None
                 })
 
     return items
@@ -218,7 +254,7 @@ def extract_line_items(text: str) -> List[Dict[str, Any]]:
 def extract_fields(text: str) -> Dict[str, Any]:
     """
     Extracts structured financial information from OCR raw text.
-    Implements the Generic Invoice Schema with Common and Optional fields.
+    Generic invoice parsing engine supporting all Indian GST invoice layouts.
     """
     fields: Dict[str, Any] = {
         # Common Fields
@@ -304,28 +340,30 @@ def extract_fields(text: str) -> Dict[str, Any]:
     # ----------------------------------------------------------------
     # 2. Invoice / Proforma / Challan Numbers
     # ----------------------------------------------------------------
-    inv_matches = re.findall(
-        r"(?:Invoice|Bill|Inv)\s*(?:No|Num|Number|#|\.)\s*[:\-]?\s*([A-Za-z0-9/\-]+)",
-        text, re.I
-    )
-    for match_val in inv_matches:
-        clean_val = match_val.strip().strip(".")
-        if clean_val.upper() not in ["ORIGINAL", "DUPLICATE", "TRIPLICATE", "RECIPIENT", "SUPPLIER", "TAX", "INVOICE", "DATE"]:
-            fields["invoice_number"] = clean_val
+    ignore_inv_words = {
+        "ORIGINAL", "DUPLICATE", "TRIPLICATE", "RECIPIENT", "SUPPLIER", "TAX",
+        "INVOICE", "DATE", "DETAILS", "ADDRESS", "DESCRIPTION", "TOTAL", "AMOUNT",
+        "PAYABLE", "INR", "RS", "BILL", "TO", "SHIP", "FOR", "NO", "YES", "NA", "N/A", "NONE"
+    }
+
+    inv_patterns = [
+        r"(?:Invoice|Inv|Bill|Tax\s*Invoice|Document|Doc|Voucher|Receipt|Ref)\s*(?:No|Num|Number|#|\.|\:)?\s*[\W_]*([A-Za-z0-9/\-_]{2,30})",
+        r"(?:Invoice|Inv|Bill)\s*#\s*([A-Za-z0-9/\-_]{2,30})",
+        r"\b(?:No|Num|Number|#)\s*[\:\-\=]\s*([A-Za-z0-9/\-_]{2,30})"
+    ]
+
+    for pat in inv_patterns:
+        matches = re.findall(pat, text, re.I)
+        for match_val in matches:
+            clean_val = match_val.strip().strip(".:-=")
+            if clean_val.upper() not in ignore_inv_words and len(clean_val) >= 1 and not re.match(r"^\d{1,2}$", clean_val):
+                fields["invoice_number"] = clean_val
+                break
+        if fields["invoice_number"]:
             break
 
-    if not fields["invoice_number"]:
-        fallback_inv = re.search(
-            r"(?:Tax\s*Invoice|Ref)\s*(?:No|Num|Number|\.)\s*[:\-]?\s*([A-Za-z0-9/\-]+)",
-            text, re.I
-        )
-        if fallback_inv:
-            val = fallback_inv.group(1).strip().strip(".")
-            if val.upper() not in ["ORIGINAL", "DUPLICATE", "TRIPLICATE", "RECIPIENT", "SUPPLIER", "TAX", "INVOICE", "DATE"]:
-                fields["invoice_number"] = val
-
     proforma_match = re.search(
-        r"Proforma\s*(?:No|Num|Number|\.)\s*[:\-]?\s*([A-Za-z0-9/\-]+)",
+        r"Proforma\s*(?:No|Num|Number|#|\.)\s*[\:\-\=]?\s*([A-Za-z0-9/\-_]+)",
         text, re.I
     )
     if proforma_match:
@@ -334,7 +372,7 @@ def extract_fields(text: str) -> Dict[str, Any]:
             fields["invoice_number"] = fields["proforma_number"]
 
     challan_match = re.search(
-        r"Challan\s*(?:No|Num|Number|\.)\s*[:\-]?\s*([A-Za-z0-9/\-]+)",
+        r"Challan\s*(?:No|Num|Number|#|\.)\s*[\:\-\=]?\s*([A-Za-z0-9/\-_]+)",
         text, re.I
     )
     if challan_match:
@@ -348,28 +386,27 @@ def extract_fields(text: str) -> Dict[str, Any]:
     # 3. Dates
     # ----------------------------------------------------------------
     inv_date_match = re.search(
-        r"(?:Invoice|Bill|Document)\s*Date\s*[:\-]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
+        r"(?:Invoice|Bill|Document|Doc|Dated)\s*Date\s*[\:\-\=\.]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
         text, re.I
     )
     if inv_date_match:
         fields["invoice_date"] = parse_date(inv_date_match.group(1))
 
+    due_date_match = re.search(
+        r"Due\s*Date\s*[\:\-\=\.]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
+        text, re.I
+    )
+    if due_date_match:
+        fields["due_date"] = parse_date(due_date_match.group(1))
+
     proforma_date_match = re.search(
-        r"Proforma\s*Date\s*[:\-]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
+        r"Proforma\s*Date\s*[\:\-\=\.]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
         text, re.I
     )
     if proforma_date_match:
         fields["proforma_date"] = parse_date(proforma_date_match.group(1))
         if not fields["invoice_date"]:
             fields["invoice_date"] = fields["proforma_date"]
-
-    if not fields["invoice_date"]:
-        challan_date = re.search(
-            r"Challan\s*Date\s*[:\-]?\s*(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})",
-            text, re.I
-        )
-        if challan_date:
-            fields["invoice_date"] = parse_date(challan_date.group(1))
 
     if not fields["invoice_date"]:
         any_date = re.search(r"\b(\d{1,2}[\s\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\s\-/\.]\d{2,4})\b", text)
@@ -380,19 +417,29 @@ def extract_fields(text: str) -> Dict[str, Any]:
     # 4. Supplier & Customer Names
     # ----------------------------------------------------------------
     text_lines = [line.strip() for line in text.split("\n") if line.strip()]
+    header_ignore_pattern = r"\b(?:TAX\s*INVOICE|INVOICE|ORIGINAL|DUPLICATE|TRIPLICATE|FOR\s*RECIPIENT|RECIPIENT|BILL\s*OF\s*SUPPLY|PROFORMA)\b"
+
     if text_lines:
-        for l in text_lines[:3]:
-            if len(l) > 5 and not re.match(r"^[\W\d]+$", l):
-                clean_l = re.sub(r"\b(?:TAX\s*INVOICE|INVOICE|ORIGINAL|DUPLICATE|TRIPLICATE|FOR\s*RECIPIENT|RECIPIENT)\b.*$", "", l, flags=re.I).strip().strip(".").strip()
-                if clean_l:
-                    fields["supplier_name"] = clean_l
-                else:
-                    fields["supplier_name"] = l.strip()
+        for l in text_lines[:6]:
+            clean_l = re.sub(r"^[a-zA-Z]\.\s*", "", l)  # Remove OCR noise prefix like 'y. '
+            clean_l = re.sub(header_ignore_pattern, "", clean_l, flags=re.I).strip(" :-=.|/")
+            if len(clean_l) > 3 and not re.match(r"^[\W\d]+$", clean_l) and clean_l.upper() not in ["GSTIN", "INVOICE", "DETAILS"]:
+                fields["supplier_name"] = clean_duplicate_phrase(clean_l)
                 break
 
-    cust_match = re.search(r"(?:M/?[Ss]|BILL\s*TO|BUYER)\s*[:\-]?\s*([A-Za-z0-9\s&.,'()\-]+)", text, re.I)
-    if cust_match:
-        fields["customer_name"] = cust_match.group(1).split("\n")[0].strip()
+    # Customer block extraction
+    cust_block_match = re.search(r"(?:BILL\s*TO|BUYER|CUSTOMER|PARTY\s*NAME|CONSIGNEE)\b.*?\n([^\n]+)", text, re.I)
+    if cust_block_match:
+        c_name = cust_block_match.group(1).strip(" :-=.|/")
+        c_name = re.sub(r"(?:SHIP\s*TO|GSTIN|PLACE\s*OF\s*SUPPLY|ADDRESS).*$", "", c_name, flags=re.I).strip()
+        c_name = re.sub(r"\([^\)]*\)", "", c_name).strip()
+        if len(c_name) > 2 and c_name.upper() not in ["DETAILS", "ADDRESS"]:
+            fields["customer_name"] = clean_duplicate_phrase(c_name)
+
+    if not fields["customer_name"]:
+        cust_match = re.search(r"M/[Ss]\.?\s*([A-Za-z0-9\s&.,'()\-]{2,50})", text, re.I)
+        if cust_match:
+            fields["customer_name"] = clean_duplicate_phrase(cust_match.group(1).split("\n")[0].strip())
 
     # ----------------------------------------------------------------
     # 5. Place of Supply
@@ -404,112 +451,98 @@ def extract_fields(text: str) -> Dict[str, Any]:
     # ----------------------------------------------------------------
     # 6. Financial Amounts — ROBUST multi-pattern extraction
     # ----------------------------------------------------------------
+    def extract_clean_amount(pattern: str, src_text: str) -> Optional[float]:
+        m = re.search(pattern, src_text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return parse_number(m.group(1))
+        return None
+
     # Taxable Amount
     taxable_patterns = [
-        r"Taxable\s*(?:Amount|Value)\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        r"Sub[\s\-]?[Tt]otal\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
+        r"Taxable\s*(?:Amount|Value|Val)\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Sub\s*[\-\=]?\s*Total\s*(?:Taxable\s*Amount)?\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Total\s*Before\s*Tax\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Assessed\s*Value\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
     ]
     for pat in taxable_patterns:
-        m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            fields["taxable_amount"] = parse_number(m.group(1))
+        val = extract_clean_amount(pat, text)
+        if val is not None and val > 0:
+            fields["taxable_amount"] = val
             break
 
     # CGST Amount & Rate
     cgst_rate = None
-    cgst_match = re.search(
-        r"CGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    if cgst_match:
-        cgst_rate = parse_number(cgst_match.group(1))
-        fields["cgst"] = parse_number(cgst_match.group(2))
-    else:
-        cgst_plain = re.search(
-            r"CGST\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-            text, re.IGNORECASE | re.MULTILINE
-        )
-        if cgst_plain:
-            fields["cgst"] = parse_number(cgst_plain.group(1))
+    cgst_patterns = [
+        r"CGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"CGST\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+    ]
+    for pat in cgst_patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            if m.lastindex == 2:
+                cgst_rate = parse_number(m.group(1))
+                fields["cgst"] = parse_number(m.group(2))
+            else:
+                fields["cgst"] = parse_number(m.group(1))
+            break
 
     # SGST Amount & Rate
     sgst_rate = None
-    sgst_match = re.search(
-        r"SGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    if sgst_match:
-        sgst_rate = parse_number(sgst_match.group(1))
-        fields["sgst"] = parse_number(sgst_match.group(2))
-    else:
-        sgst_plain = re.search(
-            r"SGST\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-            text, re.IGNORECASE | re.MULTILINE
-        )
-        if sgst_plain:
-            fields["sgst"] = parse_number(sgst_plain.group(1))
+    sgst_patterns = [
+        r"SGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"SGST\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+    ]
+    for pat in sgst_patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            if m.lastindex == 2:
+                sgst_rate = parse_number(m.group(1))
+                fields["sgst"] = parse_number(m.group(2))
+            else:
+                fields["sgst"] = parse_number(m.group(1))
+            break
 
     # IGST Amount & Rate
     igst_rate = None
-    igst_match = re.search(
-        r"(?:Add\s*[:\-]\s*)?IGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    if igst_match:
-        igst_rate = parse_number(igst_match.group(1))
-        fields["igst"] = parse_number(igst_match.group(2))
-    else:
-        igst_plain = re.search(
-            r"(?:Add\s*[:\-]\s*)?IGST\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-            text, re.IGNORECASE | re.MULTILINE
-        )
-        if igst_plain:
-            fields["igst"] = parse_number(igst_plain.group(1))
-
-    # Total Tax
-    total_tax_match = re.search(
-        r"Total\s*Tax\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        text, re.IGNORECASE | re.MULTILINE
-    )
-    if total_tax_match:
-        fields["total_tax"] = parse_number(total_tax_match.group(1))
-
-    # Derive total_tax if not found
-    if fields["total_tax"] is None:
-        if fields["igst"] is not None:
-            fields["total_tax"] = fields["igst"]
-        elif fields["cgst"] is not None and fields["sgst"] is not None:
-            fields["total_tax"] = round(fields["cgst"] + fields["sgst"], 2)
-
-    # Sanity check for CGST/SGST OCR misreads (e.g., 254.77 instead of 54.77 when total_tax is 109.53)
-    if fields["total_tax"] is not None:
-        if fields["cgst"] is not None and fields["cgst"] > fields["total_tax"]:
-            if fields["sgst"] is not None and fields["sgst"] <= fields["total_tax"]:
-                fields["cgst"] = round(fields["total_tax"] - fields["sgst"], 2)
-            else:
-                fields["cgst"] = round(fields["total_tax"] / 2.0, 2)
-
-        if fields["sgst"] is not None and fields["sgst"] > fields["total_tax"]:
-            if fields["cgst"] is not None and fields["cgst"] <= fields["total_tax"]:
-                fields["sgst"] = round(fields["total_tax"] - fields["cgst"], 2)
-            else:
-                fields["sgst"] = round(fields["total_tax"] / 2.0, 2)
-
-    # Grand Total
-    total_patterns = [
-        r"Total\s*Amount\s*After\s*Tax\s*[:\-]?\s*₹?\s*\'?\s*([\d,]+\.?\d*)",
-        r"Grand\s*Total\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        r"Amount\s*Payable\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        r"Total\s*Amount\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
-        r"NET\s*(?:TOTAL|AMOUNT)\s*[:\-]?\s*₹?\s*([\d,]+\.?\d*)",
+    igst_patterns = [
+        r"(?:Add\s*[:\-]\s*)?IGST\s*(?:@|\(?)\s*(\d{1,2}(?:\.\d+)?)\s*%?\)?\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"(?:Add\s*[:\-]\s*)?IGST\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
     ]
-    for pat in total_patterns:
+    for pat in igst_patterns:
         m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
         if m:
-            val = parse_number(m.group(1))
-            if val is not None and val > 0:
-                fields["total_amount"] = val
-                break
+            if m.lastindex == 2:
+                igst_rate = parse_number(m.group(1))
+                fields["igst"] = parse_number(m.group(2))
+            else:
+                fields["igst"] = parse_number(m.group(1))
+            break
+
+    # Total Tax
+    total_tax_patterns = [
+        r"Total\s*(?:GST|Tax)\s*(?:Amount)?\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"GST\s*Total\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+    ]
+    for pat in total_tax_patterns:
+        val = extract_clean_amount(pat, text)
+        if val is not None and val > 0:
+            fields["total_tax"] = val
+            break
+
+    # Grand Total
+    grand_total_patterns = [
+        r"Grand\s*Total\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Total\s*Amount\s*After\s*Tax\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Amount\s*Payable\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Net\s*(?:Total|Amount|Payable)\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Total\s*Amount\s*(?:\([^\)]*\))?\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+        r"Invoice\s*Total\s*[:\-=]?\s*[₹RsINR\s]*([\d,]+\.?\d*)",
+    ]
+    for pat in grand_total_patterns:
+        val = extract_clean_amount(pat, text)
+        if val is not None and val > 0:
+            fields["total_amount"] = val
+            break
 
     # GST Rate Determination (safe & precise)
     if cgst_rate is not None and sgst_rate is not None:
@@ -580,7 +613,7 @@ def extract_fields(text: str) -> Dict[str, Any]:
         fields["bank_details"]["ifsc"] = ifsc_m.group(1)
 
     # ----------------------------------------------------------------
-    # 10. Line Items Table
+    # 10. Line Items Table & Self-Healing Math Deductions
     # ----------------------------------------------------------------
     fields["items"] = extract_line_items(text)
     if fields["items"]:
@@ -604,7 +637,21 @@ def extract_fields(text: str) -> Dict[str, Any]:
                 if item.get("tax_rate")
             ]
             if item_rates:
-                fields["gst_rate"] = item_rates[0]  # Use first item's rate
+                fields["gst_rate"] = item_rates[0]
+
+    # Derive total_tax if not found
+    if fields["total_tax"] is None:
+        if fields["igst"] is not None:
+            fields["total_tax"] = fields["igst"]
+        elif fields["cgst"] is not None and fields["sgst"] is not None:
+            fields["total_tax"] = round(fields["cgst"] + fields["sgst"], 2)
+
+    # Self-healing math deductions if any totals are missing
+    if fields["total_amount"] is None and fields["taxable_amount"] is not None and fields["total_tax"] is not None:
+        fields["total_amount"] = round(fields["taxable_amount"] + fields["total_tax"], 2)
+
+    if fields["taxable_amount"] is None and fields["total_amount"] is not None and fields["total_tax"] is not None:
+        fields["taxable_amount"] = round(fields["total_amount"] - fields["total_tax"], 2)
 
     # Final fallback for GST rate: calculate from total_tax / taxable_amount
     if fields["gst_rate"] is None and fields.get("taxable_amount") and fields.get("total_tax") and fields["taxable_amount"] > 0:

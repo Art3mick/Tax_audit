@@ -78,17 +78,12 @@ def preprocess_image(image_bytes: bytes) -> Tuple[np.ndarray, np.ndarray]:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    # 5. Denoise
+    # 5. Denoise with Gaussian Blur
     denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
 
-    # 6. Adaptive thresholding
-    processed = cv2.adaptiveThreshold(
-        denoised,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        11,
-        2
+    # 6. Clean Otsu Binarization (avoids speckle/dithering noise)
+    _, processed = cv2.threshold(
+        denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
     return image, processed, enhanced  # (bgr_original, binary_thresh, clahe_gray)
